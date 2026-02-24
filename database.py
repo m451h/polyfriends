@@ -1,7 +1,10 @@
 import sqlite3
 from contextlib import contextmanager
 
-DB_PATH = "/data/polyfriends.db"  # mount your Railway volume at /data
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "polyfriends.db") # mount your Railway volume at /data
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
