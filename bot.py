@@ -1,73 +1,70 @@
+"""
+PolyFriends Bot - simplified UX + full inline mode
+===================================================
+Slash commands are kept minimal. Almost everything happens through
+market cards posted into the chat via @bot inline query.
+
+Flow:
+  User types @bot          → list of open markets + balance + leaderboard cards
+  Taps a market card       → posts card into chat with action buttons
+  Taps Bet YES / Bet NO    → amount picker buttons appear on the card
+  Taps an amount           → card updates with result (visible to all)
+  Taps Sell                → side picker → amount picker → card updates
+"""
+
 import logging
 import os
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update,
+    InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResultArticle, InputTextMessageContent,
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    InlineQueryHandler, ConversationHandler, MessageHandler,
+    InlineQueryHandler, ChosenInlineResultHandler,
+    ConversationHandler, MessageHandler,
     ContextTypes, filters,
 )
 from telegram.constants import ParseMode
 
 import logic
-import formatting
-from database import init_db
+import formatting as fmt
+from database import init_db, get_db
 
 logging.basicConfig(
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["BOT_TOKEN"]
 
-# Conversation states
+# Conversation states for /propose
 PROPOSE_QUESTION, PROPOSE_DEADLINE = range(2)
-SELL_MARKET, SELL_SIDE, SELL_SHARES = range(3)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def group_only(func):
-    """Decorator: reject command if used outside a group."""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type == "private":
-            await update.message.reply_text(
-                "⚠️ This command only works inside a group chat."
-            )
-            return
-        return await func(update, context)
-    wrapper.__name__ = func.__name__
-    return wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def register(update: Update) -> dict:
     u = update.effective_user
     return logic.get_or_create_user(u.id, u.username or u.first_name)
 
 async def ensure_group(update: Update) -> dict:
-    chat = update.effective_chat
-    return logic.get_or_create_group(chat.id, chat.title or str(chat.id))
+    c = update.effective_chat
+    return logic.get_or_create_group(c.id, c.title or str(c.id))
 
-async def require_member(update: Update) -> dict | None:
-    """Returns membership dict or sends error and returns None."""
-    user  = update.effective_user
-    chat  = update.effective_chat
-    m = logic.get_membership(user.id, chat.id)
-    if not m:
-        await update.message.reply_text(
-            "⚠️ You haven't joined this group yet. Use /join to play!"
-        )
-    return m
-
-async def admin_only(update: Update) -> bool:
-    if not logic.is_admin(update.effective_user.id, update.effective_chat.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return False
-    return True
+def group_only(func):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_chat.type == "private":
+            await update.message.reply_text("⚠️ Use this command inside a group chat.")
+            return
+        return await func(update, ctx)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 async def notify_admins(app, group_id: int, text: str):
     for uid in logic.get_admin_ids(group_id):
@@ -76,664 +73,563 @@ async def notify_admins(app, group_id: int, text: str):
         except Exception:
             pass
 
-async def send(update: Update, text: str, **kwargs):
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
-
-
-# ── /start ────────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    await send(update,
-        "👋 *Welcome to PolyFriends!*\n\n"
-        "A prediction market for your group.\n\n"
-        "Add me to a group, then use */join* in that group to get your *1000 starting points*.\n\n"
-        "*/help* — full command list"
-    )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send(update,
-        "*PolyFriends Commands*\n\n"
-        "*Player:*\n"
-        "/join — Join the prediction market in this group\n"
-        "/balance — Your points balance\n"
-        "/markets — Open markets\n"
-        "/market <id> — Market detail + bet buttons\n"
-        "/bet <id> YES|NO <pts> — Place a bet\n"
-        "/sell <id> YES|NO <shares> — Sell shares back\n"
-        "/positions — Your open positions\n"
-        "/leaderboard — Group rankings\n"
-        "/propose — Propose a new market\n\n"
-        "*Admin:*\n"
-        "/pending — Markets awaiting approval\n"
-        "/approve <id> — Open a market\n"
-        "/reject <id> — Reject a market\n"
-        "/resolve <id> YES|NO|CANCELLED — Settle a market\n"
-        "/addadmin — Make yourself admin (first run only)\n"
-        "/givepoints @user <amount> — Grant points\n\n"
-        "*Inline:*\n"
-        "Type `@YourBotName` in any chat to see your positions!"
-    )
-
-
-# ── /join ─────────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user  = await register(update)
-    group = await ensure_group(update)
-
-    newly_joined = logic.join_group(user["telegram_id"], group["group_id"])
-
-    if newly_joined:
-        await send(update,
-            f"🎉 Welcome to *{group['name']}*, *{user['username']}*!\n"
-            f"You've been given *1000 points* to start betting.\n\n"
-            f"Check open markets with /markets"
-        )
-    else:
-        m = logic.get_membership(user["telegram_id"], group["group_id"])
-        await send(update,
-            f"You're already a member of *{group['name']}*.\n"
-            f"Balance: *{m['balance']:.1f} pts*"
-        )
-
-
-# ── /balance ──────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    await ensure_group(update)
-    m = await require_member(update)
-    if not m:
-        return
-    await send(update, f"💰 *{m['username']}* — *{m['balance']:.1f} pts*")
-
-
-# ── /markets ──────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    group = await ensure_group(update)
-    markets = logic.get_markets(group["group_id"], "open")
-
-    if not markets:
-        await send(update, "No open markets right now. Propose one with /propose!")
-        return
-
-    lines = [f"🟢 *Open Markets* ({len(markets)})\n"]
-    for m in markets:
-        lines.append(formatting.fmt_market(m))
-        lines.append(f"👉 /market {m['id']}\n")
-
-    await send(update, "\n".join(lines))
-
-
-# ── /market <id> ──────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    group = await ensure_group(update)
-
-    if not context.args:
-        await send(update, "Usage: /market <id>")
-        return
-    try:
-        market_id = int(context.args[0])
-    except ValueError:
-        await send(update, "Market ID must be a number.")
-        return
-
-    market = logic.get_market(market_id, group["group_id"])
-    if not market:
-        await send(update, "Market not found.")
-        return
-
-    text = formatting.fmt_market(market)
-
-    if market["status"] == "open":
-        keyboard = [[
-            InlineKeyboardButton("✅ YES", callback_data=f"bet_YES_{market_id}"),
-            InlineKeyboardButton("❌ NO",  callback_data=f"bet_NO_{market_id}"),
-        ]]
-        await update.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await send(update, text)
-
-
-# ── /bet ──────────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    group = await ensure_group(update)
-    m = await require_member(update)
-    if not m:
-        return
-
-    args = context.args
-    if len(args) != 3:
-        await send(update, "Usage: /bet <market\\_id> YES|NO <points>\nExample: /bet 3 YES 100")
-        return
-
-    try:
-        market_id = int(args[0])
-        side      = args[1].upper()
-        points    = float(args[2])
-    except ValueError:
-        await send(update, "Invalid format. Example: /bet 3 YES 100")
-        return
-
-    try:
-        market, shares = logic.place_bet(
-            update.effective_user.id, group["group_id"], market_id, side, points
-        )
-    except logic.BetError as e:
-        await send(update, f"❌ {e}")
-        return
-
-    yes_p, no_p = logic.get_odds(market)
-    price = yes_p if side == "YES" else no_p
-    await send(update,
-        f"✅ *Bet placed!*\n\n"
-        f"{formatting.fmt_market(market)}\n\n"
-        f"You bought *{shares:.3f} {side} shares* for *{points:.1f} pts*\n"
-        f"Price: {price:.2%}"
-    )
-
-
-# ── /sell ─────────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /sell <market_id> YES|NO <shares>"""
-    await register(update)
-    group = await ensure_group(update)
-    m = await require_member(update)
-    if not m:
-        return
-
-    args = context.args
-    if len(args) != 3:
-        await send(update, "Usage: /sell <market\\_id> YES|NO <shares>\nExample: /sell 3 YES 5.5")
-        return
-
-    try:
-        market_id     = int(args[0])
-        side          = args[1].upper()
-        shares_to_sell = float(args[2])
-    except ValueError:
-        await send(update, "Invalid format. Example: /sell 3 YES 5.5")
-        return
-
-    try:
-        market, payout = logic.sell_position(
-            update.effective_user.id, group["group_id"], market_id, side, shares_to_sell
-        )
-    except logic.SellError as e:
-        await send(update, f"❌ {e}")
-        return
-
-    updated_m = logic.get_membership(update.effective_user.id, group["group_id"])
-    await send(update,
-        f"💸 *Sold!*\n\n"
-        f"{formatting.fmt_market(market)}\n\n"
-        f"Sold *{shares_to_sell:.3f} {side} shares* → received *{payout:.1f} pts*\n"
-        f"New balance: *{updated_m['balance']:.1f} pts*"
-    )
-
-
-# ── /positions ────────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    group = await ensure_group(update)
-    m = await require_member(update)
-    if not m:
-        return
-
-    positions = logic.get_user_positions(update.effective_user.id, group["group_id"])
-    if not positions:
-        await send(update, "You have no open positions. Use /markets to find something to bet on!")
-        return
-
-    open_pos   = [p for p in positions if p["status"] == "open"]
-    closed_pos = [p for p in positions if p["status"] != "open"]
-
-    lines = [f"📊 *Your Positions in {group['name']}*\n"]
-    if open_pos:
-        lines.append("*Open:*")
-        for p in open_pos:
-            lines.append(formatting.fmt_position(p))
-            lines.append(f"  Sell: /sell {p['market_id']} {p['side']} <shares>\n")
-    if closed_pos:
-        lines.append("*Closed / Resolved:*")
-        for p in closed_pos[:5]:
-            lines.append(formatting.fmt_position(p))
-            lines.append("")
-
-    await send(update, "\n".join(lines))
-
-
-# ── /leaderboard ──────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    group = await ensure_group(update)
-    rows = logic.get_leaderboard(group["group_id"])
-    await send(update, formatting.fmt_leaderboard(rows, group["name"]))
-
-
-# ── /propose (conversation) ───────────────────────────────────────────────────
-
-@group_only
-async def cmd_propose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register(update)
-    await ensure_group(update)
-    m = await require_member(update)
-    if not m:
-        return ConversationHandler.END
-
-    context.user_data["propose_group_id"]   = update.effective_chat.id
-    context.user_data["propose_group_name"] = update.effective_chat.title
-
-    await send(update,
-        "📝 *Propose a Market*\n\n"
-        "Write a clear YES/NO question.\n"
-        "_Example: Will it rain in London on Friday?_\n\n"
-        "/cancel to abort."
-    )
-    return PROPOSE_QUESTION
-
-async def propose_got_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["question"] = update.message.text
-    await send(update,
-        "⏰ *When should betting close?*\n\n"
-        "Use `7d`, `24h` — or full datetime `2025-06-01 20:00` (UTC)."
-    )
-    return PROPOSE_DEADLINE
-
-async def propose_got_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user  = await register(update)
-    text  = update.message.text.strip()
-
-    deadline = _parse_deadline(text)
-    if not deadline:
-        await send(update, "❌ Couldn't parse that. Try `7d`, `48h`, or `2025-06-01 20:00`.")
-        return PROPOSE_DEADLINE
-
-    question = context.user_data["question"]
-    group_id = context.user_data["propose_group_id"]
-
-    market_id = logic.propose_market(question, user["telegram_id"], group_id, deadline)
-
-    await send(update,
-        f"✅ Market *#{market_id}* proposed!\n\n"
-        f"_{question}_\n"
-        f"Deadline: {deadline} UTC\n\n"
-        f"Waiting for admin approval…"
-    )
-
-    await notify_admins(context.application, group_id,
-        f"📢 *New market proposal* from @{user['username']}\n\n"
-        f"*#{market_id}:* {question}\n"
-        f"Deadline: {deadline} UTC\n\n"
-        f"/approve {market_id} | /reject {market_id}"
-    )
-    return ConversationHandler.END
-
-async def propose_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send(update, "❌ Proposal cancelled.")
-    return ConversationHandler.END
-
-def _parse_deadline(text: str) -> str | None:
+def _parse_deadline(text: str):
     try:
         if text.endswith("d"):
             return (datetime.utcnow() + timedelta(days=int(text[:-1]))).strftime("%Y-%m-%d %H:%M")
         if text.endswith("h"):
             return (datetime.utcnow() + timedelta(hours=int(text[:-1]))).strftime("%Y-%m-%d %H:%M")
         return datetime.strptime(text, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
+    except Exception:
         return None
 
-
-# ── Admin Commands ────────────────────────────────────────────────────────────
-
-@group_only
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    group   = await ensure_group(update)
-    markets = logic.get_markets(group["group_id"], "pending")
-
-    if not markets:
-        await send(update, "No pending markets.")
-        return
-
-    lines = [f"⏳ *Pending Markets* ({len(markets)})\n"]
-    for m in markets:
-        lines.append(formatting.fmt_market(m))
-        lines.append(f"/approve {m['id']} | /reject {m['id']}\n")
-    await send(update, "\n".join(lines))
-
-@group_only
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    group = await ensure_group(update)
-    if not context.args:
-        await send(update, "Usage: /approve <id>")
-        return
-
-    market_id = int(context.args[0])
-    logic.approve_market(market_id, update.effective_user.id, group["group_id"])
-    market = logic.get_market(market_id, group["group_id"])
-    await send(update, f"✅ Market approved!\n\n{formatting.fmt_market(market)}")
-
-@group_only
-async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    group = await ensure_group(update)
-    if not context.args:
-        await send(update, "Usage: /reject <id>")
-        return
-
-    market_id = int(context.args[0])
-    logic.reject_market(market_id, update.effective_user.id, group["group_id"])
-    await send(update, f"❌ Market #{market_id} rejected.")
-
-@group_only
-async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    group = await ensure_group(update)
-    args  = context.args
-    if len(args) < 2:
-        await send(update, "Usage: /resolve <id> YES|NO|CANCELLED")
-        return
-
-    market_id  = int(args[0])
-    resolution = args[1].upper()
-
-    try:
-        logic.resolve_market(market_id, group["group_id"], resolution, update.effective_user.id)
-    except ValueError as e:
-        await send(update, f"❌ {e}")
-        return
-
-    market = logic.get_market(market_id, group["group_id"])
-    await send(update,
-        f"🏁 *Market #{market_id} resolved: {resolution}*\n\n"
-        f"{formatting.fmt_market(market)}"
-    )
-
-async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group    = await ensure_group(update)
-    group_id = group["group_id"]
-    caller   = update.effective_user.id
-
-    with logic.get_db() as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM admins WHERE group_id=?", (group_id,)
-        ).fetchone()[0]
-
-    if count > 0 and not logic.is_admin(caller, group_id):
-        await send(update, "⛔ Only existing admins can add admins.")
-        return
-
-    logic.add_admin(caller, group_id)
-    await send(update, "✅ You are now an admin in this group.")
-
-@group_only
-async def cmd_givepoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    group = await ensure_group(update)
-    args  = context.args
-
-    if len(args) < 2:
-        await send(update, "Usage: /givepoints @username <amount>")
-        return
-
-    try:
-        amount = float(args[-1])
-    except ValueError:
-        await send(update, "Amount must be a number.")
-        return
-
-    # Resolve @username mention
-    target_username = args[0].lstrip("@")
-    with logic.get_db() as conn:
-        target = conn.execute(
-            "SELECT * FROM users WHERE username=?", (target_username,)
-        ).fetchone()
-
-    if not target:
-        await send(update, f"User @{target_username} not found.")
-        return
-
-    logic.give_points(target["telegram_id"], group["group_id"], amount)
-    await send(update, f"✅ Gave *{amount:.0f} pts* to @{target_username}.")
+def _group_id_from_cb(data: str) -> int:
+    """group_id is always the last segment of callback_data."""
+    return int(data.rsplit("_", 1)[-1])
 
 
-# ── Inline Button Callbacks ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Simple slash commands (kept as minimal as possible)
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def callback_bet_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fired when user taps YES or NO button on a market."""
-    query     = update.callback_query
-    await query.answer()
-
-    _, side, market_id_str = query.data.split("_")
-    market_id = int(market_id_str)
-    group_id  = query.message.chat.id
-
-    user = logic.get_or_create_user(
-        query.from_user.id,
-        query.from_user.username or query.from_user.first_name
-    )
-    if not logic.is_member(user["telegram_id"], group_id):
-        await query.answer("Use /join first to become a player!", show_alert=True)
-        return
-
-    market = logic.get_market(market_id, group_id)
-    if not market or market["status"] != "open":
-        await query.edit_message_text("Market is no longer open.")
-        return
-
-    yes_p, no_p = logic.get_odds(market)
-    price = yes_p if side == "YES" else no_p
-    m     = logic.get_membership(user["telegram_id"], group_id)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("50",  callback_data=f"amt_{side}_{market_id}_50"),
-            InlineKeyboardButton("100", callback_data=f"amt_{side}_{market_id}_100"),
-            InlineKeyboardButton("200", callback_data=f"amt_{side}_{market_id}_200"),
-            InlineKeyboardButton("500", callback_data=f"amt_{side}_{market_id}_500"),
-        ],
-        [InlineKeyboardButton("« Back", callback_data=f"back_{market_id}")]
-    ]
-
-    emoji = "✅" if side == "YES" else "❌"
-    await query.edit_message_text(
-        f"{emoji} Betting *{side}* on:\n_{market['question']}_\n\n"
-        f"Current price: *{price:.2%}*\n"
-        f"Your balance: *{m['balance']:.1f} pts*\n\n"
-        f"How many points?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def callback_bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts     = query.data.split("_")   # amt_YES_3_100
-    side      = parts[1]
-    market_id = int(parts[2])
-    points    = float(parts[3])
-    group_id  = query.message.chat.id
-
-    user = logic.get_or_create_user(
-        query.from_user.id,
-        query.from_user.username or query.from_user.first_name
-    )
-
-    try:
-        market, shares = logic.place_bet(
-            user["telegram_id"], group_id, market_id, side, points
-        )
-    except logic.BetError as e:
-        await query.answer(str(e), show_alert=True)
-        return
-
-    yes_p, no_p = logic.get_odds(market)
-    price = yes_p if side == "YES" else no_p
-    updated_m = logic.get_membership(user["telegram_id"], group_id)
-
-    await query.edit_message_text(
-        f"✅ *Bet placed!*\n\n"
-        f"{formatting.fmt_market(market)}\n\n"
-        f"Bought *{shares:.3f} {side} shares* for *{points:.1f} pts*\n"
-        f"Price: {price:.2%} | Balance: *{updated_m['balance']:.1f} pts*",
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await register(update)
+    await update.message.reply_text(
+        "👋 *Welcome to PolyFriends!*\n\n"
+        "To play in a group:\n"
+        "1️⃣ Type */join* in the group chat\n"
+        "2️⃣ Type *@YourBot* in the group to browse & bet on markets\n\n"
+        "That's it! Everything else happens inside the market cards 🎯",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def callback_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+@group_only
+async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user  = await register(update)
+    group = await ensure_group(update)
+    newly = logic.join_group(user["telegram_id"], group["group_id"])
 
-    market_id = int(query.data.split("_")[1])
-    group_id  = query.message.chat.id
-    market    = logic.get_market(market_id, group_id)
+    if newly:
+        await update.message.reply_text(
+            f"🎉 *{user['username']}* joined *{group['name']}*!\n"
+            f"You have *1000 points* to bet with.\n\n"
+            f"Type @{ctx.bot.username} to browse markets 👆",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        m = logic.get_membership(user["telegram_id"], group["group_id"])
+        await update.message.reply_text(
+            f"You're already in *{group['name']}*.\n"
+            f"Balance: *{m['balance']:.1f} pts*\n\n"
+            f"Type @{ctx.bot.username} to browse markets 👆",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
-    keyboard = [[
-        InlineKeyboardButton("✅ YES", callback_data=f"bet_YES_{market_id}"),
-        InlineKeyboardButton("❌ NO",  callback_data=f"bet_NO_{market_id}"),
-    ]]
-    await query.edit_message_text(
-        formatting.fmt_market(market),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+@group_only
+async def cmd_propose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await register(update)
+    await ensure_group(update)
+    if not logic.is_member(update.effective_user.id, update.effective_chat.id):
+        await update.message.reply_text("Use /join first!")
+        return ConversationHandler.END
+
+    ctx.user_data["propose_group_id"] = update.effective_chat.id
+    await update.message.reply_text(
+        "📝 What's your market question? (clear YES/NO question)\n\n"
+        "Example: _Will it rain in London on Friday?_\n\n"
+        "/cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return PROPOSE_QUESTION
+
+async def propose_got_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["question"] = update.message.text
+    await update.message.reply_text(
+        "⏰ When should betting close?\n\n"
+        "Type `7d`, `24h` or a date like `2025-06-01 20:00` (UTC)",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return PROPOSE_DEADLINE
+
+async def propose_got_deadline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user     = await register(update)
+    deadline = _parse_deadline(update.message.text.strip())
+    if not deadline:
+        await update.message.reply_text("❌ Can't parse that. Try `7d`, `48h` or `2025-06-01 20:00`")
+        return PROPOSE_DEADLINE
+
+    question = ctx.user_data["question"]
+    group_id = ctx.user_data["propose_group_id"]
+    market_id = logic.propose_market(question, user["telegram_id"], group_id, deadline)
+
+    await update.message.reply_text(
+        f"✅ *Market #{market_id} proposed!*\n_{question}_\nDeadline: {deadline} UTC\n\nWaiting for admin approval…",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await notify_admins(ctx.application, group_id,
+        f"📢 New proposal from @{user['username']}\n\n"
+        f"*#{market_id}:* {question}\nDeadline: {deadline} UTC\n\n"
+        f"/approve {market_id} | /reject {market_id}"
+    )
+    return ConversationHandler.END
+
+async def propose_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+# ── Admin slash commands ──────────────────────────────────────────────────────
+
+async def _admin_check(update: Update) -> bool:
+    if not logic.is_admin(update.effective_user.id, update.effective_chat.id):
+        await update.message.reply_text("⛔ Admins only.")
+        return False
+    return True
+
+@group_only
+async def cmd_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_check(update): return
+    group = await ensure_group(update)
+    if not ctx.args:
+        await update.message.reply_text("Usage: /approve <id>"); return
+    mid = int(ctx.args[0])
+    logic.approve_market(mid, update.effective_user.id, group["group_id"])
+    market = logic.get_market(mid, group["group_id"])
+    await update.message.reply_text(
+        f"✅ Market #{mid} is now open!\n\n{fmt.market_card(market)}\n\n"
+        f"Share it: type @{ctx.bot.username} in the chat",
+        parse_mode=ParseMode.MARKDOWN
     )
 
+@group_only
+async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_check(update): return
+    group = await ensure_group(update)
+    if not ctx.args:
+        await update.message.reply_text("Usage: /reject <id>"); return
+    logic.reject_market(int(ctx.args[0]), update.effective_user.id, group["group_id"])
+    await update.message.reply_text(f"❌ Market #{ctx.args[0]} rejected.")
 
-# ── Inline Query (type @botname anywhere) ─────────────────────────────────────
+@group_only
+async def cmd_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_check(update): return
+    group = await ensure_group(update)
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /resolve <id> YES|NO|CANCELLED"); return
+    mid, res = int(ctx.args[0]), ctx.args[1].upper()
+    try:
+        logic.resolve_market(mid, group["group_id"], res, update.effective_user.id)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}"); return
+    market = logic.get_market(mid, group["group_id"])
+    await update.message.reply_text(
+        f"🏁 *Market #{mid} resolved: {res}*\n\n{fmt.market_card(market)}",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@group_only
+async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_check(update): return
+    group   = await ensure_group(update)
+    markets = logic.get_markets(group["group_id"], "pending")
+    if not markets:
+        await update.message.reply_text("No pending markets."); return
+    lines = [f"⏳ *Pending ({len(markets)})*\n"]
+    for m in markets:
+        lines.append(f"*#{m['id']}* {m['question']}\n/approve {m['id']} | /reject {m['id']}\n")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    group    = logic.get_or_create_group(update.effective_chat.id, update.effective_chat.title or "")
+    group_id = group["group_id"]
+    caller   = update.effective_user.id
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM admins WHERE group_id=?", (group_id,)).fetchone()[0]
+    if count > 0 and not logic.is_admin(caller, group_id):
+        await update.message.reply_text("⛔ Only existing admins can add admins."); return
+    logic.add_admin(caller, group_id)
+    await update.message.reply_text("✅ You're now an admin in this group.")
+
+@group_only
+async def cmd_givepoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_check(update): return
+    group = await ensure_group(update)
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /givepoints @username <amount>"); return
+    username = ctx.args[0].lstrip("@")
+    try: amount = float(ctx.args[1])
+    except ValueError:
+        await update.message.reply_text("Amount must be a number."); return
+    with get_db() as conn:
+        target = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not target:
+        await update.message.reply_text(f"User @{username} not found."); return
+    logic.give_points(target["telegram_id"], group["group_id"], amount)
+    await update.message.reply_text(f"✅ Gave *{amount:.0f} pts* to @{username}.", parse_mode=ParseMode.MARKDOWN)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline Query - the main entry point for players
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query_text = update.inline_query.query.strip().lower()
     user_id    = update.inline_query.from_user.id
     results    = []
 
-    # Gather all positions across all groups this user has joined
-    with logic.get_db() as conn:
-        groups = conn.execute(
+    # All groups this user has joined
+    with get_db() as conn:
+        memberships = conn.execute(
             """SELECT g.group_id, g.name, m.balance
-               FROM memberships m
-               JOIN groups g ON g.group_id = m.group_id
+               FROM memberships m JOIN groups g ON g.group_id = m.group_id
                WHERE m.user_id = ?""",
             (user_id,)
         ).fetchall()
 
-    for g in groups:
-        group_id   = g["group_id"]
-        group_name = g["name"]
-        balance    = g["balance"]
+    memberships = [dict(r) for r in memberships]
 
-        # Open markets in this group (filtered by query if provided)
-        markets = logic.get_markets(group_id, "open")
-        for m in markets:
-            if query_text and query_text not in m["question"].lower():
-                continue
+    # ── Balance card (always first when no query) ─────────────────────────
+    if not query_text and memberships:
+        results.append(InlineQueryResultArticle(
+            id="balance",
+            title="💰 My Balances",
+            description=" · ".join(f"{g['name']}: {g['balance']:.0f}pts" for g in memberships),
+            input_message_content=InputTextMessageContent(
+                fmt.balance_card(update.inline_query.from_user.first_name, memberships),
+                parse_mode=ParseMode.MARKDOWN,
+            ),
+        ))
 
-            yes_p, no_p = logic.get_odds(m)
-            text = (
-                f"📊 *{m['question']}*\n"
-                f"Group: {group_name}\n"
-                f"YES {yes_p:.0%} — NO {no_p:.0%}\n"
-                f"Use /market {m['id']} in the group to bet."
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=f"market_{group_id}_{m['id']}",
-                    title=m["question"][:60],
-                    description=f"{group_name} | YES {yes_p:.0%} / NO {no_p:.0%}",
-                    input_message_content=InputTextMessageContent(
-                        text, parse_mode=ParseMode.MARKDOWN
-                    ),
-                )
-            )
-
-    # If no query, also show a summary card per group
+    # ── Leaderboard cards ─────────────────────────────────────────────────
     if not query_text:
-        for g in groups:
-            results.insert(0, InlineQueryResultArticle(
-                id=f"balance_{g['group_id']}",
-                title=f"💰 {g['name']}",
-                description=f"Your balance: {g['balance']:.1f} pts",
+        for g in memberships:
+            rows = logic.get_leaderboard(g["group_id"])
+            results.append(InlineQueryResultArticle(
+                id=f"lb_{g['group_id']}",
+                title=f"🏆 {g['name']} Leaderboard",
+                description=f"Top: {', '.join(r['username'] for r in rows[:3])}",
                 input_message_content=InputTextMessageContent(
-                    f"💰 Balance in *{g['name']}*: *{g['balance']:.1f} pts*",
-                    parse_mode=ParseMode.MARKDOWN
+                    fmt.leaderboard_card(rows, g["name"]),
+                    parse_mode=ParseMode.MARKDOWN,
                 ),
             ))
 
-    await update.inline_query.answer(results[:50], cache_time=10)
+    # ── Market cards (one per open market across all joined groups) ───────
+    for g in memberships:
+        markets = logic.get_markets(g["group_id"], "open")
+        for m in markets:
+            if query_text and query_text not in m["question"].lower() and query_text != str(m["id"]):
+                continue
+            # Buttons are injected AFTER posting via chosen_inline_result handler.
+            # reply_markup on InlineQueryResultArticle does NOT attach buttons to the message.
+            results.append(InlineQueryResultArticle(
+                id=f"market_{g['group_id']}_{m['id']}",
+                title=fmt.market_card_short(m),
+                description="Tap to post this market card with bet buttons",
+                input_message_content=InputTextMessageContent(
+                    fmt.market_card(m) + "\n\n_⏳ Loading buttons…_",
+                    parse_mode=ParseMode.MARKDOWN,
+                ),
+            ))
+
+    await update.inline_query.answer(results[:50], cache_time=5)
 
 
-# ── Scheduler Jobs ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Chosen inline result - fires when user picks a result from the inline list.
+# This is the ONLY reliable way to attach buttons to an inline-posted message.
+# REQUIREMENT: Set inline feedback to 100% in BotFather → /setinlinefeedback
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def job_close_expired_markets(context: ContextTypes.DEFAULT_TYPE):
-    with logic.get_db() as conn:
-        open_markets = conn.execute(
+async def chosen_inline_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    result    = update.chosen_inline_result
+    result_id = result.result_id   # e.g. "market_-1001234_7"
+
+    if not result_id.startswith("market_"):
+        return  # balance/leaderboard cards need no buttons
+
+    try:
+        _, group_id_str, market_id_str = result_id.split("_", 2)
+        group_id  = int(group_id_str)
+        market_id = int(market_id_str)
+    except ValueError:
+        return
+
+    market = logic.get_market(market_id, group_id)
+    if not market:
+        return
+
+    # Edit the just-posted message → add real card text + action buttons
+    try:
+        await ctx.bot.edit_message_text(
+            inline_message_id=result.inline_message_id,
+            text=fmt.market_card(market),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=fmt.kb_market(market_id, group_id),
+        )
+    except Exception as e:
+        logger.warning(f"Could not edit inline message: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback handlers - all the button logic on posted market cards
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _user_from_query(query) -> dict:
+    u = query.from_user
+    return logic.get_or_create_user(u.id, u.username or u.first_name)
+
+def _check_member(user_id: int, group_id: int, query) -> bool:
+    if not logic.is_member(user_id, group_id):
+        return False
+    return True
+
+async def _refresh_card(query, market: dict, group_id: int):
+    """Update the card text + restore main keyboard."""
+    await query.edit_message_text(
+        fmt.market_card(market),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_market(market["id"], group_id),
+    )
+
+# ── Refresh ───────────────────────────────────────────────────────────────────
+
+async def cb_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # data: refresh_<market_id>_<group_id>
+    query     = update.callback_query
+    await query.answer()
+    group_id  = _group_id_from_cb(query.data)
+    market_id = int(query.data.split("_")[1])
+    market    = logic.get_market(market_id, group_id)
+    if not market:
+        await query.answer("Market not found.", show_alert=True); return
+    await _refresh_card(query, market, group_id)
+
+# ── Bet side picker ───────────────────────────────────────────────────────────
+
+async def cb_side(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped Bet YES or Bet NO - show amount buttons."""
+    # data: side_<YES|NO>_<market_id>_<group_id>
+    query    = update.callback_query
+    await query.answer()
+    user     = _user_from_query(query)
+    group_id = _group_id_from_cb(query.data)
+
+    if not _check_member(user["telegram_id"], group_id, query):
+        await query.answer("Use /join in this group first!", show_alert=True); return
+
+    parts     = query.data.split("_")
+    side      = parts[1]
+    market_id = int(parts[2])
+    market    = logic.get_market(market_id, group_id)
+
+    if not market or market["status"] != "open":
+        await query.answer("This market is no longer open.", show_alert=True); return
+
+    m           = logic.get_membership(user["telegram_id"], group_id)
+    yes_p, no_p = logic.get_odds(market)
+    price       = yes_p if side == "YES" else no_p
+    emoji       = "✅" if side == "YES" else "❌"
+
+    await query.edit_message_text(
+        f"{fmt.market_card(market)}\n\n"
+        f"{emoji} *Betting {side}* at {price:.0%}\n"
+        f"Your balance: *{m['balance']:.1f} pts*\n\n"
+        f"How many points?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_amounts(side, market_id, group_id),
+    )
+
+# ── Bet amount ────────────────────────────────────────────────────────────────
+
+async def cb_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User picked an amount - place the bet."""
+    # data: amt_<YES|NO>_<market_id>_<points>_<group_id>
+    query    = update.callback_query
+    await query.answer()
+    user     = _user_from_query(query)
+    group_id = _group_id_from_cb(query.data)
+
+    parts     = query.data.split("_")
+    side      = parts[1]
+    market_id = int(parts[2])
+    points    = float(parts[3])
+
+    try:
+        market, shares = logic.place_bet(user["telegram_id"], group_id, market_id, side, points)
+    except logic.BetError as e:
+        await query.answer(str(e), show_alert=True); return
+
+    m           = logic.get_membership(user["telegram_id"], group_id)
+    yes_p, no_p = logic.get_odds(market)
+    price       = yes_p if side == "YES" else no_p
+    emoji       = "✅" if side == "YES" else "❌"
+
+    await query.edit_message_text(
+        f"{fmt.market_card(market)}\n\n"
+        f"*{user['username']}* bet {emoji} *{side}* - "
+        f"{shares:.2f} shares for {points:.0f} pts @ {price:.0%}\n"
+        f"Balance: {m['balance']:.1f} pts",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_market(market_id, group_id),
+    )
+
+# ── My position ───────────────────────────────────────────────────────────────
+
+async def cb_mypos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # data: mypos_<market_id>_<group_id>
+    query     = update.callback_query
+    user      = _user_from_query(query)
+    group_id  = _group_id_from_cb(query.data)
+    market_id = int(query.data.split("_")[1])
+
+    if not _check_member(user["telegram_id"], group_id, query):
+        await query.answer("Use /join in this group first!", show_alert=True); return
+
+    positions = logic.get_user_positions(user["telegram_id"], group_id)
+    pos_here  = [p for p in positions if p["market_id"] == market_id]
+
+    if not pos_here:
+        await query.answer("You have no position in this market yet.", show_alert=True); return
+
+    text = "\n\n".join(fmt.position_card(p) for p in pos_here)
+    await query.answer(text[:200], show_alert=True)
+
+# ── Sell: pick side ───────────────────────────────────────────────────────────
+
+async def cb_sell_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # data: sell_pick_<market_id>_<group_id>
+    query     = update.callback_query
+    await query.answer()
+    user      = _user_from_query(query)
+    group_id  = _group_id_from_cb(query.data)
+    market_id = int(query.data.split("_")[2])
+
+    if not _check_member(user["telegram_id"], group_id, query):
+        await query.answer("Use /join first!", show_alert=True); return
+
+    positions = logic.get_user_positions(user["telegram_id"], group_id)
+    pos_here  = {p["side"]: p for p in positions if p["market_id"] == market_id}
+
+    if not pos_here:
+        await query.answer("You have no position in this market.", show_alert=True); return
+
+    market  = logic.get_market(market_id, group_id)
+    has_yes = "YES" in pos_here
+    has_no  = "NO"  in pos_here
+
+    await query.edit_message_text(
+        f"{fmt.market_card(market)}\n\n💸 *Which position do you want to sell?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_sell_sides(market_id, group_id, has_yes, has_no),
+    )
+
+# ── Sell: pick side → show amount buttons ─────────────────────────────────────
+
+async def cb_sell_side(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # data: sellside_<YES|NO>_<market_id>_<group_id>
+    query    = update.callback_query
+    await query.answer()
+    user     = _user_from_query(query)
+    group_id = _group_id_from_cb(query.data)
+
+    parts     = query.data.split("_")
+    side      = parts[1]
+    market_id = int(parts[2])
+
+    positions = logic.get_user_positions(user["telegram_id"], group_id)
+    pos       = next((p for p in positions if p["market_id"] == market_id and p["side"] == side), None)
+
+    if not pos or pos["net_shares"] <= 0:
+        await query.answer("No shares to sell.", show_alert=True); return
+
+    market      = logic.get_market(market_id, group_id)
+    yes_p, no_p = logic.get_odds(market)
+    price       = yes_p if side == "YES" else no_p
+    value       = pos["net_shares"] * price
+
+    await query.edit_message_text(
+        f"{fmt.market_card(market)}\n\n"
+        f"💸 Selling *{side}* shares\n"
+        f"You hold: {pos['net_shares']:.3f} shares ≈ {value:.1f} pts at {price:.0%}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_sell_amounts(side, market_id, group_id, pos["net_shares"]),
+    )
+
+# ── Sell: execute ─────────────────────────────────────────────────────────────
+
+async def cb_sell_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # data: sellamt_<YES|NO>_<market_id>_<shares>_<group_id>
+    query    = update.callback_query
+    await query.answer()
+    user     = _user_from_query(query)
+    group_id = _group_id_from_cb(query.data)
+
+    parts          = query.data.split("_")
+    side           = parts[1]
+    market_id      = int(parts[2])
+    shares_to_sell = float(parts[3])
+
+    try:
+        market, payout = logic.sell_position(user["telegram_id"], group_id, market_id, side, shares_to_sell)
+    except logic.SellError as e:
+        await query.answer(str(e), show_alert=True); return
+
+    m = logic.get_membership(user["telegram_id"], group_id)
+    await query.edit_message_text(
+        f"{fmt.market_card(market)}\n\n"
+        f"*{user['username']}* sold {shares_to_sell} *{side}* shares → +{payout:.1f} pts\n"
+        f"Balance: {m['balance']:.1f} pts",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fmt.kb_market(market_id, group_id),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_close_expired(ctx: ContextTypes.DEFAULT_TYPE):
+    with get_db() as conn:
+        markets = conn.execute(
             "SELECT * FROM markets WHERE status='open' AND deadline IS NOT NULL"
         ).fetchall()
-
     now = datetime.utcnow()
-    for m in open_markets:
+    for m in markets:
+        m = dict(m)
         if datetime.fromisoformat(m["deadline"]) < now:
             logic.close_market(m["id"])
             logger.info(f"Auto-closed market #{m['id']}")
-            await notify_admins(
-                context.application, m["group_id"],
-                f"⏰ Market *#{m['id']}* closed (deadline reached).\n"
-                f"_{m['question']}_\n\n"
-                f"Resolve: /resolve {m['id']} YES | NO"
+            await notify_admins(ctx.application, m["group_id"],
+                f"⏰ Market *#{m['id']}* closed.\n_{m['question']}_\n\n"
+                f"Resolve: /resolve {m['id']} YES | NO | CANCELLED"
             )
 
-async def job_weekly_refill(context: ContextTypes.DEFAULT_TYPE):
-    with logic.get_db() as conn:
+async def job_weekly_refill(ctx: ContextTypes.DEFAULT_TYPE):
+    with get_db() as conn:
         groups = conn.execute("SELECT group_id FROM groups").fetchall()
-
     for g in groups:
         group_id = g["group_id"]
         affected = logic.do_weekly_refill(group_id)
         if affected:
             try:
-                await context.bot.send_message(
+                await ctx.bot.send_message(
                     group_id,
-                    formatting.fmt_refill_announce(affected),
+                    fmt.refill_announce(affected),
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception:
                 pass
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# App wiring
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     init_db()
-
     app = Application.builder().token(TOKEN).build()
 
+    # Propose conversation
     propose_conv = ConversationHandler(
         entry_points=[CommandHandler("propose", cmd_propose)],
         states={
@@ -743,40 +639,36 @@ def main():
         fallbacks=[CommandHandler("cancel", propose_cancel)],
     )
 
-    # User commands
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_help))
-    app.add_handler(CommandHandler("join",        cmd_join))
-    app.add_handler(CommandHandler("balance",     cmd_balance))
-    app.add_handler(CommandHandler("markets",     cmd_markets))
-    app.add_handler(CommandHandler("market",      cmd_market))
-    app.add_handler(CommandHandler("bet",         cmd_bet))
-    app.add_handler(CommandHandler("sell",        cmd_sell))
-    app.add_handler(CommandHandler("positions",   cmd_positions))
-    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
-    app.add_handler(propose_conv)
-
-    # Admin commands
-    app.add_handler(CommandHandler("pending",    cmd_pending))
+    # Slash commands (kept minimal)
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("join",       cmd_join))
+    app.add_handler(CommandHandler("addadmin",   cmd_addadmin))
     app.add_handler(CommandHandler("approve",    cmd_approve))
     app.add_handler(CommandHandler("reject",     cmd_reject))
     app.add_handler(CommandHandler("resolve",    cmd_resolve))
-    app.add_handler(CommandHandler("addadmin",   cmd_addadmin))
+    app.add_handler(CommandHandler("pending",    cmd_pending))
     app.add_handler(CommandHandler("givepoints", cmd_givepoints))
+    app.add_handler(propose_conv)
 
-    # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(callback_bet_side,   pattern=r"^bet_(YES|NO)_\d+$"))
-    app.add_handler(CallbackQueryHandler(callback_bet_amount, pattern=r"^amt_"))
-    app.add_handler(CallbackQueryHandler(callback_back,       pattern=r"^back_\d+$"))
-
-    # Inline query
+    # Inline query + chosen result (chosen result injects buttons after posting)
     app.add_handler(InlineQueryHandler(inline_query))
+    app.add_handler(ChosenInlineResultHandler(chosen_inline_result))
+
+    # Card button callbacks - group_id is embedded in callback_data as last segment
+    # Pattern: action_[side_]marketId_groupId
+    app.add_handler(CallbackQueryHandler(cb_refresh,     pattern=r"^refresh_\d+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_side,        pattern=r"^side_(YES|NO)_\d+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_amount,      pattern=r"^amt_(YES|NO)_\d+_[\d.]+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_mypos,       pattern=r"^mypos_\d+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sell_pick,   pattern=r"^sell_pick_\d+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sell_side,   pattern=r"^sellside_(YES|NO)_\d+_-?\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sell_amount, pattern=r"^sellamt_(YES|NO)_\d+_[\d.]+_-?\d+$"))
 
     # Scheduler
-    app.job_queue.run_repeating(job_close_expired_markets, interval=60,   first=15)
-    app.job_queue.run_repeating(job_weekly_refill,         interval=604800, first=10)  # every 7 days
+    app.job_queue.run_repeating(job_close_expired,  interval=60,     first=15)
+    app.job_queue.run_repeating(job_weekly_refill,  interval=604800, first=30)
 
-    logger.info("🚀 PolyFriends started!")
+    logger.info("🚀 PolyFriends v2 started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
