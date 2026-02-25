@@ -1,4 +1,4 @@
-# 🎯 PolyFriends v2
+#  PolyFriends
 
 Prediction market bot for Telegram friend groups — everything happens through inline market cards.
 
